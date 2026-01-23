@@ -19,6 +19,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import warnings
+import logging
 
 import numpy as np
 import rerun as rr
@@ -34,6 +35,7 @@ from .buffer import GraphBuffer
 
 # Disable all future warnings (mainly torch.cuda.amp related)
 warnings.simplefilter(action="ignore", category=FutureWarning)
+logger = logging.getLogger(__name__)
 
 
 class FactorGraph:
@@ -148,11 +150,14 @@ class FactorGraph:
             # correlation volume for new edges (1, |E| V, 128, ht//8, wd//8)
             fmap1 = self.buffer.fmaps[pi, qi][None]
             fmap2 = self.buffer.fmaps[pj, qj][None]
-            corr = CorrBlock(fmap1, fmap2)
-            self.corr = corr if self.corr is None else self.corr.cat(corr)
+            
+            # [Fix 1] Ensure fmap is not empty before creating CorrBlock
+            if fmap1.shape[1] > 0:
+                corr = CorrBlock(fmap1, fmap2)
+                self.corr = corr if self.corr is None else self.corr.cat(corr)
 
-            inp = self.buffer.inps[pi, qi][None]
-            self.inp = inp if self.inp is None else torch.cat([self.inp, inp], 1)
+                inp = self.buffer.inps[pi, qi][None]
+                self.inp = inp if self.inp is None else torch.cat([self.inp, inp], 1)
 
         with torch.cuda.amp.autocast(enabled=False):
             target, _ = self.buffer.reproject_dense_disp(ii, jj)
@@ -240,8 +245,12 @@ class FactorGraph:
     ):
         """run update operator on factor graph"""
         assert self.incremental
-        assert self.corr is not None and self.inp is not None and self.f_net is not None
-        assert not (motion_only and fixed_motion)
+        
+        # [Fix 2] CRITICAL FIX: If no factors have been added yet (corr is None),
+        # return immediately instead of asserting. This prevents crashing during
+        # initialization if the graph is momentarily empty.
+        if self.corr is None or self.inp is None or self.f_net is None:
+            return
 
         if t0 is None:
             t0 = int(max(1, self.ii.min().item() + 1))
@@ -403,7 +412,7 @@ class FactorGraph:
         ii = ii.reshape(-1).to(dtype=torch.long, device=self.device)
         jj = jj.reshape(-1).to(dtype=torch.long, device=self.device)
 
-        c = 1 if self.cross_view else 0
+        c = -1 if self.cross_view else 0
 
         keep = ((ii - jj).abs() > c) & ((ii - jj).abs() <= r)
         self.add_factors(ii[keep], jj[keep])

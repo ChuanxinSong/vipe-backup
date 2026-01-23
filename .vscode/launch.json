@@ -1,0 +1,35 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "VIPE Panorama Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                // --- Hydra & Pipeline Config ---
+                "pipeline=panorama",
+                "streams=raw_mp4_stream",
+                "pipeline.post.depth_align_model=unik3d",
+                "pipeline.output.save_artifacts=true",
+
+                // --- Input Path ---
+                // !!! 请务必将这里的路径修改为您自己的视频绝对路径或相对路径 !!!
+                "streams.base_path=web360/web360_for_depthcrafter/rgb/web360/100003.mp4",
+
+                // --- Explicitly define output directory for clarity ---
+                // 这会将所有输出（包括日志）都强制放入 vipe_results 目录
+                // "hydra.run.dir=vipe_results/vipe/${now:%Y-%m-%d_%H-%M-%S}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "7"  // 指定第0号GPU
+            }
+        }
+    ]
+}

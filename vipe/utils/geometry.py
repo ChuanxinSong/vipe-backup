@@ -112,7 +112,9 @@ def project_points_to_panorama(
     """
     depth = torch.linalg.norm(xyz, dim=-1)
     u = torch.atan2(xyz[..., 0], xyz[..., 2])  # [-pi, pi]
-    v = torch.acos(-xyz[..., 1] / depth)  # [0, pi]
+    # v = torch.acos(-xyz[..., 1] / depth)  # [0, pi]
+    cos_v = (-xyz[..., 1] / (depth + 1e-8)).clamp(-1.0, 1.0)
+    v = torch.acos(cos_v)  # [0, pi]
     u = u / (2 * torch.pi) + 0.5  # [0, 1]
     v = v / torch.pi  # [0, 1]
     if return_depth:

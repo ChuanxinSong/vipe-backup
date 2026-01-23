@@ -52,18 +52,20 @@ logger = logging.getLogger(__name__)
 class MergedPanoramaVideoStream(VideoStream):
     # Determines how much height of the panorama is kept for depth estimation.
     # This way we crop the top and bottom of the input to avoid distortion (where depth estimation is not reliable).
-    DEPTH_KEEP_RATIO = 0.6
+    # DEPTH_KEEP_RATIO = 0.6
+    DEPTH_KEEP_RATIO = 1.0
+
 
     def __init__(
         self,
         pano_stream: VideoStream,
-        projected_streams: list[VideoStream],
+        # projected_streams: list[VideoStream],
         slam_output: SLAMOutput,
         pano_depth_method: str | None,
     ):
-        assert len(projected_streams) > 0
+        # assert len(projected_streams) > 0
         self.pano_stream = pano_stream
-        self.projected_streams = projected_streams
+        # self.projected_streams = projected_streams
         self.slam_output = slam_output
         self.pano_depth_method = pano_depth_method
 
@@ -90,43 +92,149 @@ class MergedPanoramaVideoStream(VideoStream):
 
         last_inv_scale = 1.0
 
-        for frame_idx, (pano_frame_data, *projected_frame_data) in enumerate(
-            zip(self.pano_stream, *self.projected_streams)
-        ):
+        # for frame_idx, (pano_frame_data, *projected_frame_data) in enumerate(
+            # zip(self.pano_stream, *self.projected_streams)
+        # ):
+        for frame_idx, pano_frame_data in enumerate(self.pano_stream):
             pano_frame_data.intrinsics = torch.zeros(4).float().cuda()
             pano_frame_data.pose = self.slam_output.trajectory[frame_idx]
             pano_frame_data.camera_type = CameraType.PANORAMA
 
-            if self.pano_depth_model is not None:
-                height_crop = int(pano_frame_data.size()[0] * (1 - self.DEPTH_KEEP_RATIO) / 2)
-                full_distance = torch.zeros(pano_frame_data.size()).cuda()
-                croped_distance = self.pano_depth_model.estimate(
-                    DepthEstimationInput(
-                        rgb=pano_frame_data.rgb[height_crop:-height_crop],
-                    )
-                ).metric_depth
+            # if self.pano_depth_model is not None:
+            #     height_crop = int(pano_frame_data.size()[0] * (1 - self.DEPTH_KEEP_RATIO) / 2)
+            #     full_distance = torch.zeros(pano_frame_data.size()).cuda()
+            #     croped_distance = self.pano_depth_model.estimate(
+            #         DepthEstimationInput(
+            #             rgb=pano_frame_data.rgb[height_crop:-height_crop],
+            #         )
+            #     ).metric_depth
+            # if self.pano_depth_model is not None:
+            #     height, width = pano_frame_data.size()
+            #     height_crop = int(height * (1 - self.DEPTH_KEEP_RATIO) / 2)
+                
+            #     # [修复] 处理 height_crop 为 0 的情况
+            #     if height_crop > 0:
+            #         rgb_input = pano_frame_data.rgb[height_crop : -height_crop]
+            #     else:
+            #         rgb_input = pano_frame_data.rgb  # 直接使用全图
 
-                # Align distance map
+            #     full_distance = torch.zeros(pano_frame_data.size()).cuda()
+            #     croped_distance = self.pano_depth_model.estimate(
+            #         DepthEstimationInput(
+            #             rgb=rgb_input,
+            #         )
+            #     ).metric_depth
+
+            #     # Align distance map
+            #     assert xyz_global is not None
+            #     xyz = pano_frame_data.pose.inv()[None].act(xyz_global)
+            #     uvd = project_points_to_panorama(xyz, return_depth=True)
+            #     uvd[:, 0] *= pano_frame_data.size()[1]
+            #     uvd[:, 1] *= pano_frame_data.size()[0]
+            #     target_depth = torch.zeros(pano_frame_data.size(), device="cuda")
+            #     target_depth[uvd[:, 1].floor().long(), uvd[:, 0].floor().long()] = uvd[:, 2]
+            #     target_depth = target_depth[height_crop : height - height_crop]
+            #     target_mask = target_depth > 0
+
+            #     if target_mask.float().sum() < 0.05 * target_mask.numel():
+            #         logger.warning(f"Too few valid pixels in pano frame {frame_idx}, skipping scale estimation.")
+            #         inv_scale = last_inv_scale
+            #     else:
+            #         inv_scale = torch.median(croped_distance[target_mask] / target_depth[target_mask]).item()
+            #         last_inv_scale = inv_scale
+
+            #     # full_distance[height_crop:-height_crop] = croped_distance / inv_scale
+            #     full_distance[height_crop : height - height_crop] = croped_distance / inv_scale
+            #     pano_frame_data.metric_depth = full_distance
+
+
+            if self.pano_depth_model is not None:
+                # 1. 获取图像尺寸
+                height, width = pano_frame_data.size()
+                height_crop = int(height * (1 - self.DEPTH_KEEP_RATIO) / 2)
+                
+                # 2. 准备输入图像 (使用绝对坐标切片，兼容 height_crop=0)
+                # 这样写比 if-else 更简洁安全
+                rgb_input = pano_frame_data.rgb[height_crop : height - height_crop]
+
+                # 3. 运行深度模型
+                full_distance = torch.zeros(pano_frame_data.size(), device="cuda")
+                
+                # 只有切片不为空时才推理
+                if rgb_input.numel() > 0:
+                    croped_distance = self.pano_depth_model.estimate(
+                        DepthEstimationInput(
+                            rgb=rgb_input,
+                        )
+                    ).metric_depth
+                else:
+                    # 异常保护：如果没有像素，创建一个空张量防止下面计算出错
+                    croped_distance = torch.zeros((0, width), device="cuda")
+
+                # 4. 对齐距离图 (Align distance map)
                 assert xyz_global is not None
                 xyz = pano_frame_data.pose.inv()[None].act(xyz_global)
                 uvd = project_points_to_panorama(xyz, return_depth=True)
-                uvd[:, 0] *= pano_frame_data.size()[1]
-                uvd[:, 1] *= pano_frame_data.size()[0]
+                uvd[:, 0] *= width
+                uvd[:, 1] *= height
                 target_depth = torch.zeros(pano_frame_data.size(), device="cuda")
-                target_depth[uvd[:, 1].floor().long(), uvd[:, 0].floor().long()] = uvd[:, 2]
-                target_depth = target_depth[height_crop:-height_crop]
+
+                # =========== [关键修复] 安全赋值，防止 CUDA 崩溃 ===========
+                # a. 检查 NaN/Inf (防止非法数值转整数导致崩溃)
+                valid_uvd = torch.isfinite(uvd).all(dim=-1)
+                
+                # b. 计算整数索引
+                u_indices = uvd[:, 0].floor().long()
+                v_indices = uvd[:, 1].floor().long()
+
+                # c. 创建合法掩码：必须是有效数值 且 在图像范围内
+                valid_mask = (
+                    valid_uvd & 
+                    (u_indices >= 0) & (u_indices < width) & 
+                    (v_indices >= 0) & (v_indices < height)
+                )
+
+                # d. 仅对合法索引进行赋值
+                if valid_mask.any():
+                    target_depth[v_indices[valid_mask], u_indices[valid_mask]] = uvd[valid_mask, 2]
+                # =========== [关键修复结束] ===========
+
+                # 5. 切片 target_depth (使用绝对坐标)
+                target_depth = target_depth[height_crop : height - height_crop]
                 target_mask = target_depth > 0
 
-                if target_mask.float().sum() < 0.05 * target_mask.numel():
+                # 6. 计算 Scale (增加保护逻辑)
+                if not target_mask.any():
+                    logger.warning(f"No valid pixels in pano frame {frame_idx}, skipping scale estimation.")
+                    inv_scale = last_inv_scale
+                elif target_mask.float().sum() < 0.05 * target_mask.numel():
                     logger.warning(f"Too few valid pixels in pano frame {frame_idx}, skipping scale estimation.")
                     inv_scale = last_inv_scale
                 else:
-                    inv_scale = torch.median(croped_distance[target_mask] / target_depth[target_mask]).item()
-                    last_inv_scale = inv_scale
+                    # 确保维度匹配 (防止 croped_distance 为空或形状不一致)
+                    if croped_distance.shape == target_depth.shape:
+                        try:
+                            # 再次过滤，确保除法安全
+                            valid_calc_mask = target_mask & (target_depth > 1e-6)
+                            if valid_calc_mask.any():
+                                inv_scale = torch.median(
+                                    croped_distance[valid_calc_mask] / target_depth[valid_calc_mask]
+                                ).item()
+                                last_inv_scale = inv_scale
+                            else:
+                                inv_scale = last_inv_scale
+                        except Exception:
+                            inv_scale = last_inv_scale
+                    else:
+                        inv_scale = last_inv_scale
 
-                full_distance[height_crop:-height_crop] = croped_distance / inv_scale
+                # 7. 赋值回 full_distance (使用绝对坐标)
+                end_idx = height - height_crop
+                # 确保维度匹配且非空
+                if height_crop < end_idx and croped_distance.shape[0] == (end_idx - height_crop):
+                    full_distance[height_crop : end_idx] = croped_distance / inv_scale
+                
                 pano_frame_data.metric_depth = full_distance
-
             yield pano_frame_data
 
     def attributes(self) -> set[FrameAttribute]:

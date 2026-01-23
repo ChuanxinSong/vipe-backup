@@ -167,3 +167,11 @@ vipe_results/
 /try_*.py
 /external/
 JIAHUI.md
+
+# Symlinks and Large Data
+/DepthCrafter
+/web360
+/carla_benchmark_results
+/web360_results
+/vipe_results/
+/depth_eval/

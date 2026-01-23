@@ -383,7 +383,7 @@ class CachedVideoStream(VideoStream):
         # If iteration is finished, we can release the iterator
         if len(self.data) == len(self):
             self.iterator = None
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
         return self.data[index].cuda()
 
