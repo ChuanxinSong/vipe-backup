@@ -175,3 +175,10 @@ JIAHUI.md
 /web360_results
 /vipe_results/
 /depth_eval/
+pose_eval_results
+genex_realword_top50_res512
+OmniRoam
+equi_data
+pose_exports
+profiles_flops_memory
+WorldScore

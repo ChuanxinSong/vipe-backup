@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import json
 import numpy as np
@@ -27,19 +28,9 @@ logger = logging.getLogger("infer_vipe")
 
 # --- 可视化工具 (复用您提供的代码) ---
 try:
-    from depth_eval.utils import vis_sequence_depth, save_video
+    from depth_eval.utils import save_video
 except ImportError:
     print("Warning: depth_eval.utils not found. Using fallback visualization.")
-    def vis_sequence_depth(depths):
-        vis = []
-        for d in depths:
-            d = 1.0 / (d + 1e-6)
-            d_min, d_max = d.min(), d.max()
-            d_norm = (d - d_min) / (d_max - d_min + 1e-8)
-            d_color = cv2.applyColorMap((d_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-            vis.append(cv2.cvtColor(d_color, cv2.COLOR_BGR2RGB) / 255.0)
-        return np.array(vis)
-    
     def save_video(frames, path, fps=20):
         if len(frames) == 0: return
         h, w, c = frames[0].shape
@@ -47,6 +38,41 @@ except ImportError:
         for f in frames:
             out.write((f * 255).astype(np.uint8)[:, :, ::-1])
         out.release()
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def colorize_depth_sequence(depths, valid_masks):
+    vis = []
+    invalid_color = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+    for depth, valid_mask in zip(depths, valid_masks):
+        depth_vis = np.full(depth.shape + (3,), invalid_color, dtype=np.float32)
+        if np.any(valid_mask):
+            disparity = np.zeros_like(depth, dtype=np.float32)
+            disparity[valid_mask] = 1.0 / np.maximum(depth[valid_mask], 1e-6)
+            disp_valid = disparity[valid_mask]
+            disp_min = float(disp_valid.min())
+            disp_max = float(disp_valid.max())
+            disp_norm = np.zeros_like(disparity, dtype=np.float32)
+            if disp_max - disp_min >= 1e-8:
+                disp_norm[valid_mask] = (disparity[valid_mask] - disp_min) / (disp_max - disp_min)
+
+            disp_color = cv2.applyColorMap((disp_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            disp_color = cv2.cvtColor(disp_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            depth_vis[valid_mask] = disp_color[valid_mask]
+        vis.append(depth_vis)
+
+    return np.stack(vis)
 
 # --- 适配器：将 JSON 数据转换为 Vipe 的 VideoStream ---
 class SimpleJsonVideoStream(VideoStream):
@@ -148,18 +174,20 @@ def run_vipe_inference(device, args):
     for i, clip in enumerate(all_clips):
         clip_name = clip["id"]
         print(f"\n=== Processing Clip {i+1}/{len(all_clips)}: {clip_name} ===")
+        start_time = time.time()
         
         # 准备路径
         img_paths = [os.path.join(args.image_base_dir, f['rgb_path']) for f in clip['frames']]
         
         # 输出目录设置
         setting, fps_str, len_str = extract_file_parameters(args.json_path)
-        out_dir = os.path.join(args.output_root_dir, f"town0210_{args.resolution}_{setting}_{fps_str}_{len_str}")
+        out_dir = os.path.join(args.output_root_dir, f"town0210_{args.resolution}_{setting}_{fps_str}_{len_str}_{args.depth_method}")
         os.makedirs(out_dir, exist_ok=True)
         npy_path = os.path.join(out_dir, f"{clip_name}_distance.npy")
+        valid_mask_path = os.path.join(out_dir, f"{clip_name}_distance_valid_mask.npy")
         video_path = os.path.join(out_dir, f"{clip_name}_vis.mp4")
 
-        if os.path.exists(npy_path):
+        if os.path.exists(npy_path) and os.path.exists(valid_mask_path):
             print("Result exists, skipping.")
             continue
             
@@ -217,23 +245,45 @@ def run_vipe_inference(device, args):
         slam_output = slam_pipeline.run(slam_streams, rig=rig_se3)
         
         # E. 运行深度融合 (MergedPanoramaVideoStream)
-        # 这里的关键是 depth_align_model="unik3d"，它会触发内部调用 Unik3D 并与 SLAM 稀疏点对齐
-        print(" -> Merging Panorama Depth (Vipe + Unik3D)...")
+        # 这里的关键是 depth_align_model="depthcrafter"，它会触发内部调用 DepthCrafter 并与 SLAM 稀疏点对齐
+        print(f" -> Merging Panorama Depth (Vipe + {args.depth_method})...")
+        
+        # Prepare depth model options
+        depth_options = {
+            "unet_path": args.unet_path,
+            "ppl_type": args.ppl_type,
+            "num_denoising_steps": args.num_denoising_steps,
+            "guidance_scale": args.guidance_scale,
+            "cpu_offload": args.cpu_offload,
+            "slam_infill": args.slam_infill,
+        }
+        
+        # If pre-computed results are provided, construction the path
+        if args.depthcrafter_npy_dir and args.depth_method == "depthcrafter":
+            # setting, fps_str, len_str = extract_file_parameters(args.json_path)
+            # The directory structure suggested by user is subfolders directly under the root
+            sub_dir = f"town0210_{args.resolution}_{setting}_{fps_str}_{len_str}"
+            source_npy = os.path.join(args.depthcrafter_npy_dir, sub_dir, f"{clip_name}_disparity.npy")
+            depth_options["npy_path"] = source_npy
+
         output_stream = MergedPanoramaVideoStream(
             cached_video_stream,
             # slam_streams,
             slam_output,
-            pano_depth_method="unik3d", # 强制指定 unik3d
+            pano_depth_method=args.depth_method, # 使用指定的深度方法
+            depth_options=depth_options,
         )
         
         # F. 收集结果
         all_distances = []
+        all_valid_masks = []
         original_rgbs = []
         
         for frame in tqdm(output_stream, total=len(video_stream), desc="Fusing"):
             # metric_depth 是融合并对齐后的深度
             depth = frame.metric_depth.cpu().numpy()
             all_distances.append(depth)
+            all_valid_masks.append(np.isfinite(depth) & (depth > 0))
             
             # 保存 RGB 用于可视化
             rgb = frame.rgb.cpu().numpy()
@@ -243,14 +293,15 @@ def run_vipe_inference(device, args):
 
         # 3. 保存结果
         all_distances = np.stack(all_distances) # [T, H, W]
+        all_valid_masks = np.stack(all_valid_masks).astype(np.uint8)
         np.save(npy_path, all_distances)
+        np.save(valid_mask_path, all_valid_masks)
         print(f" -> Saved NPY: {npy_path}")
+        print(f" -> Saved Valid Mask: {valid_mask_path}")
 
         # 4. 可视化
         print(f" -> Generating video...")
-        disparity = 1.0 / (all_distances + 1e-6)
-        disparity = np.nan_to_num(disparity, nan=0.0, posinf=0.0, neginf=0.0)
-        vis_colored = vis_sequence_depth(disparity)
+        vis_colored = colorize_depth_sequence(all_distances, all_valid_masks.astype(bool))
         
         combined_frames = []
         for idx in range(len(original_rgbs)):
@@ -262,6 +313,9 @@ def run_vipe_inference(device, args):
         save_video(combined_frames, video_path, fps=10)
         print(f" -> Video saved: {video_path}")
         
+        elapsed_time = time.time() - start_time
+        print(f" === Clip [{clip_name}] Done! Time: {elapsed_time:.2f}s ===")
+
         # 清理显存
         del slam_pipeline, slam_output, output_stream, cached_video_stream, slam_streams
         gc.collect()
@@ -273,8 +327,19 @@ if __name__ == '__main__':
     parser.add_argument("--image_base_dir", required=True, help="Base directory for images")
     parser.add_argument("--output_root_dir", default="vipe_results", help="Root directory for outputs")
     parser.add_argument("--resolution", type=int, default=1024, help="Width of the panorama (Height will be Width/2)")
+    parser.add_argument("--depth_method", type=str, default="depthcrafter", choices=["unik3d", "depthcrafter", "raw_slam"], help="Depth estimation method to use")
+    parser.add_argument("--slam_infill", type=str2bool, default=False, help="Whether to infill raw SLAM panorama depth")
+    
+    # DepthCrafter Specific Arguments
+    parser.add_argument("--unet_path", type=str, default="tencent/DepthCrafter")
+    parser.add_argument("--ppl_type", type=str, default="depthcrafter")
+    parser.add_argument("--num_denoising_steps", type=int, default=5)
+    parser.add_argument("--guidance_scale", type=float, default=1.0)
+    parser.add_argument("--cpu_offload", type=str, default=None, choices=["model", "sequential", "None"])
+    parser.add_argument("--depthcrafter_npy_dir", type=str, default=None, help="Root directory for pre-computed DepthCrafter .npy results")
     
     args = parser.parse_args()
+    if args.cpu_offload == "None": args.cpu_offload = None
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Initializing Vipe Inference...")

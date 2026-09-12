@@ -5,9 +5,9 @@ import os
 
 # 请根据你的实际情况修改这里的列表 (保持与 Unik3D 的测试集一致)
 JSON_FILES = [
-    # "/workspace1/songcx/dataset/pvdepth/test_benchmark/setting_dynamic_fps02_len50.json",
+    "/workspace1/songcx/dataset/pvdepth/test_benchmark/setting_dynamic_fps02_len50.json",
     # "/workspace1/songcx/dataset/pvdepth/test_benchmark/setting_dynamic_fps10_len90.json",
-    "/workspace1/songcx/dataset/pvdepth/test_benchmark/setting_dynamic_fps20_len110.json",
+    # "/workspace1/songcx/dataset/pvdepth/test_benchmark/setting_dynamic_fps20_len110.json",
     # ... 其他配置文件
 ]
 

@@ -21,6 +21,7 @@ import torch
 from vipe.ext import utils_ext
 from vipe.ext.lietorch import SE3
 from vipe.utils.cameras import CameraType
+from vipe.utils.geometry import project_points_to_panorama
 
 
 @dataclass(kw_only=True)
@@ -116,17 +117,35 @@ class SLAMMap:
         )
         disp = 1.0 / all_xyz[:, 2]
 
-        camera_model = target_camera_type.build_camera_model(target_intrinsics)
-        uv, _, _ = camera_model.proj_points(xyz_h, limit_min_depth=False)
-        uu, vv = uv[..., 0], uv[..., 1]
+        if target_camera_type == CameraType.PANORAMA:
+            uvd = project_points_to_panorama(all_xyz, return_depth=True)
+            uu = uvd[..., 0] * target_size[1]
+            vv = uvd[..., 1] * target_size[0]
+            depth = uvd[..., 2]
+            in_mask = (
+                torch.isfinite(uvd).all(dim=-1)
+                & (uu >= 0)
+                & (uu < target_size[1])
+                & (vv >= 0)
+                & (vv < target_size[0])
+                & (depth > 0)
+            )
+            uu, vv, depth = uu[in_mask], vv[in_mask], depth[in_mask]
+        else:
+            camera_model = target_camera_type.build_camera_model(target_intrinsics)
+            uv, _, _ = camera_model.proj_points(xyz_h, limit_min_depth=False)
+            uu, vv = uv[..., 0], uv[..., 1]
 
-        in_mask = (uu > 0) & (uu < target_size[1]) & (vv > 0) & (vv < target_size[0]) & (disp > 0)
-        uu, vv, depth = uu[in_mask], vv[in_mask], disp[in_mask].reciprocal()
+            in_mask = (uu > 0) & (uu < target_size[1]) & (vv > 0) & (vv < target_size[0]) & (disp > 0)
+            uu, vv, depth = uu[in_mask], vv[in_mask], disp[in_mask].reciprocal()
 
         if not infill:
             target_depth = torch.zeros(target_size, device="cuda")
             target_depth[vv.floor().long(), uu.floor().long()] = depth
         else:
+            if uu.numel() == 0:
+                return torch.zeros(target_size, device="cuda")
+
             tree = torch.stack((uu, vv), dim=-1)
             query = torch.stack(
                 torch.meshgrid(

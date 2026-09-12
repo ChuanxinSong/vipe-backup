@@ -27,6 +27,7 @@ from omegaconf import DictConfig
 from vipe.ext import lietorch as lt
 from vipe.priors.depth.base import DepthEstimationInput
 from vipe.priors.depth.unik3d import Unik3DModel
+from vipe.priors.depth.depthcrafter import DepthCrafterModel
 from vipe.slam.interface import SLAMOutput
 from vipe.slam.system import SLAMSystem
 from vipe.streams.base import (
@@ -55,25 +56,31 @@ class MergedPanoramaVideoStream(VideoStream):
     # DEPTH_KEEP_RATIO = 0.6
     DEPTH_KEEP_RATIO = 1.0
 
-
     def __init__(
         self,
         pano_stream: VideoStream,
         # projected_streams: list[VideoStream],
         slam_output: SLAMOutput,
         pano_depth_method: str | None,
+        depth_options: dict | None = None,
     ):
         # assert len(projected_streams) > 0
         self.pano_stream = pano_stream
         # self.projected_streams = projected_streams
         self.slam_output = slam_output
         self.pano_depth_method = pano_depth_method
+        self.depth_options = depth_options or {}
 
         if self.pano_depth_method == "unik3d":
             self.pano_depth_model = Unik3DModel()
-
+        elif self.pano_depth_method == "depthcrafter":
+            from vipe.priors.depth.depthcrafter import DepthCrafterModel
+            self.pano_depth_model = DepthCrafterModel(**self.depth_options)
         else:
             self.pano_depth_model = None  # type: ignore
+
+        self.precomputed_depths = None
+        self.slam_infill = bool(self.depth_options.get("slam_infill", False))
 
     def frame_size(self) -> tuple[int, int]:
         return self.pano_stream.frame_size()
@@ -85,10 +92,23 @@ class MergedPanoramaVideoStream(VideoStream):
         return len(self.pano_stream)
 
     def __iter__(self):
-        if self.pano_depth_method is not None:
+        if self.pano_depth_method in {"unik3d", "depthcrafter"}:
+            assert self.slam_output.slam_map is not None, "SLAM map is required for panorama depth alignment."
             xyz_global, _ = self.slam_output.slam_map.get_dense_disp_full_pcd()
         else:
             xyz_global = None
+
+        if self.pano_depth_method == "depthcrafter" and self.precomputed_depths is None:
+            logger.info("Precomputing DepthCrafter depths for the entire sequence...")
+            # Collect all frames
+            frames = []
+            for frame in self.pano_stream:
+                frames.append(frame.rgb)
+            frames = torch.stack(frames) # [T, H, W, 3]
+            
+            # Run DepthCrafter on the sequence
+            self.precomputed_depths = self.pano_depth_model.estimate_sequence(frames)
+            logger.info("DepthCrafter precomputation finished.")
 
         last_inv_scale = 1.0
 
@@ -99,6 +119,21 @@ class MergedPanoramaVideoStream(VideoStream):
             pano_frame_data.intrinsics = torch.zeros(4).float().cuda()
             pano_frame_data.pose = self.slam_output.trajectory[frame_idx]
             pano_frame_data.camera_type = CameraType.PANORAMA
+
+            if self.pano_depth_method == "raw_slam":
+                assert self.slam_output.slam_map is not None, "SLAM map is required for raw panorama depth."
+                pano_frame_data.metric_depth = self.slam_output.slam_map.project_map(
+                    frame_idx,
+                    -1,
+                    pano_frame_data.size(),
+                    pano_frame_data.intrinsics,
+                    pano_frame_data.pose,
+                    pano_frame_data.camera_type,
+                    infill=self.slam_infill,
+                )
+                pano_frame_data.information = "raw_slam"
+                yield pano_frame_data
+                continue
 
             # if self.pano_depth_model is not None:
             #     height_crop = int(pano_frame_data.size()[0] * (1 - self.DEPTH_KEEP_RATIO) / 2)
@@ -161,7 +196,10 @@ class MergedPanoramaVideoStream(VideoStream):
                 full_distance = torch.zeros(pano_frame_data.size(), device="cuda")
                 
                 # 只有切片不为空时才推理
-                if rgb_input.numel() > 0:
+                if self.precomputed_depths is not None:
+                    # Use precomputed depth
+                    croped_distance = self.precomputed_depths[frame_idx][height_crop : height - height_crop]
+                elif rgb_input.numel() > 0:
                     croped_distance = self.pano_depth_model.estimate(
                         DepthEstimationInput(
                             rgb=rgb_input,
@@ -233,7 +271,7 @@ class MergedPanoramaVideoStream(VideoStream):
                 # 确保维度匹配且非空
                 if height_crop < end_idx and croped_distance.shape[0] == (end_idx - height_crop):
                     full_distance[height_crop : end_idx] = croped_distance / inv_scale
-                
+
                 pano_frame_data.metric_depth = full_distance
             yield pano_frame_data
 
