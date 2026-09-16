@@ -27,6 +27,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of frames to compare. Defaults to ViPE pose length.",
     )
     parser.add_argument(
+        "--frame_manifest",
+        type=Path,
+        default=None,
+        help="Optional ViPE pose-I2V input manifest containing the exact ordered GT frame ids.",
+    )
+    parser.add_argument(
         "--align_mode",
         choices=["none", "scale", "sim3"],
         default="sim3",
@@ -68,6 +74,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--worldscore_scale_solver",
+        choices=["auto", "scipy", "cvxpy", "least_squares"],
+        default="auto",
+        help="Scalar scale solver. auto preserves the historical cvxpy/scipy/fallback order.",
+    )
+    parser.add_argument(
         "--output_csv",
         type=Path,
         default=None,
@@ -93,7 +105,32 @@ def load_vipe_poses(path: Path) -> np.ndarray:
     return poses
 
 
-def load_gt_c2w(args: argparse.Namespace, count: int) -> np.ndarray:
+def load_manifest_frame_ids(path: Path) -> list[int]:
+    with path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    frames = manifest.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError(f"{path} must contain a non-empty frames list")
+    frame_ids = []
+    for index, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            raise ValueError(f"{path} frames[{index}] must be an object")
+        frame_id = frame.get("frame_id")
+        if isinstance(frame_id, bool) or not isinstance(frame_id, int):
+            raise ValueError(f"{path} frames[{index}].frame_id must be an integer")
+        if frame_ids and frame_id <= frame_ids[-1]:
+            raise ValueError(f"{path} frame ids must be strictly increasing: {frame_ids[-1]} then {frame_id}")
+        frame_ids.append(frame_id)
+    if manifest.get("frame_count") not in (None, len(frame_ids)):
+        raise ValueError(
+            f"{path} frame_count={manifest.get('frame_count')!r} does not match frames length {len(frame_ids)}"
+        )
+    return frame_ids
+
+
+def load_gt_c2w(args: argparse.Namespace, frame_ids: list[int]) -> np.ndarray:
     with args.gt_transforms_json.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     per_image = data.get("per_image")
@@ -105,7 +142,7 @@ def load_gt_c2w(args: argparse.Namespace, count: int) -> np.ndarray:
     poses = []
     missing = []
 
-    for frame_id in range(args.frame_start, args.frame_start + count):
+    for frame_id in frame_ids:
         key = f"{frames_subdir}/frame_{frame_id:04d}.{frame_ext}"
         info = per_image.get(key)
         if not isinstance(info, dict):
@@ -218,7 +255,11 @@ def rotation_errors_deg(reference: np.ndarray, estimate: np.ndarray) -> np.ndarr
     return np.array([rotation_angle_deg(ref.T @ est) for ref, est in zip(reference, estimate)], dtype=np.float64)
 
 
-def solve_worldscore_scale(gt_positions: np.ndarray, pred_positions: np.ndarray) -> tuple[float, str]:
+def solve_worldscore_scale(
+    gt_positions: np.ndarray,
+    pred_positions: np.ndarray,
+    solver: str = "auto",
+) -> tuple[float, str]:
     if gt_positions.shape != pred_positions.shape or gt_positions.ndim != 2 or gt_positions.shape[1] != 3:
         raise ValueError(
             f"Expected matched position arrays of shape [N,3], got {gt_positions.shape} and {pred_positions.shape}"
@@ -226,42 +267,56 @@ def solve_worldscore_scale(gt_positions: np.ndarray, pred_positions: np.ndarray)
     pred_energy = float(np.sum(pred_positions**2))
     if pred_energy <= 1e-12:
         return 0.0, "degenerate_zero_prediction"
+    if solver not in {"auto", "scipy", "cvxpy", "least_squares"}:
+        raise ValueError(f"Unsupported WorldScore scale solver: {solver}")
 
     def objective(scale_value: float) -> float:
         return float(np.linalg.norm(gt_positions - scale_value * pred_positions, axis=1).sum())
 
-    try:
-        import cvxpy as cp
+    if solver in {"auto", "cvxpy"}:
+        try:
+            import cvxpy as cp
 
-        scale_var = cp.Variable()
-        problem = cp.Problem(cp.Minimize(cp.sum(cp.norm(gt_positions - scale_var * pred_positions, axis=1))))
-        problem.solve()
-        scale_value = float(scale_var.value)
-        if np.isfinite(scale_value):
+            scale_var = cp.Variable()
+            problem = cp.Problem(cp.Minimize(cp.sum(cp.norm(gt_positions - scale_var * pred_positions, axis=1))))
+            problem.solve()
+            if scale_var.value is None:
+                raise RuntimeError(f"cvxpy returned no scale value (status={problem.status})")
+            scale_value = float(scale_var.value)
+            if not np.isfinite(scale_value):
+                raise RuntimeError(f"cvxpy returned non-finite scale {scale_value}")
             return scale_value, "cvxpy"
-    except Exception:
-        pass
+        except Exception as error:
+            if solver == "cvxpy":
+                raise RuntimeError("Requested cvxpy WorldScore scale solver failed") from error
 
-    try:
-        from scipy.optimize import minimize_scalar
+    if solver in {"auto", "scipy"}:
+        try:
+            from scipy.optimize import minimize_scalar
 
-        least_squares_scale = float(np.sum(gt_positions * pred_positions) / pred_energy)
-        gt_distance = np.linalg.norm(gt_positions, axis=1).mean()
-        pred_distance = np.linalg.norm(pred_positions, axis=1).mean()
-        distance_scale = float(gt_distance / (pred_distance + 1e-12))
-        span = max(1.0, abs(least_squares_scale) * 10.0, abs(distance_scale) * 10.0)
-        result = None
-        for _ in range(6):
-            result = minimize_scalar(objective, bounds=(-span, span), method="bounded")
-            if result.success and abs(float(result.x)) < span * 0.95:
-                break
-            span *= 10.0
-        if result is not None and result.success and np.isfinite(result.x):
+            least_squares_scale = float(np.sum(gt_positions * pred_positions) / pred_energy)
+            gt_distance = np.linalg.norm(gt_positions, axis=1).mean()
+            pred_distance = np.linalg.norm(pred_positions, axis=1).mean()
+            distance_scale = float(gt_distance / (pred_distance + 1e-12))
+            span = max(1.0, abs(least_squares_scale) * 10.0, abs(distance_scale) * 10.0)
+            result = None
+            for _ in range(6):
+                result = minimize_scalar(objective, bounds=(-span, span), method="bounded")
+                if result.success and abs(float(result.x)) < span * 0.95:
+                    break
+                span *= 10.0
+            if result is None or not result.success or not np.isfinite(result.x):
+                raise RuntimeError(f"scipy minimize_scalar failed: {result}")
             return float(result.x), "scipy_minimize_scalar"
-    except Exception:
-        pass
+        except Exception as error:
+            if solver == "scipy":
+                raise RuntimeError("Requested scipy WorldScore scale solver failed") from error
 
-    return float(np.sum(gt_positions * pred_positions) / pred_energy), "least_squares_fallback"
+    if solver in {"auto", "least_squares"}:
+        least_squares_scale = float(np.sum(gt_positions * pred_positions) / pred_energy)
+        label = "least_squares" if solver == "least_squares" else "least_squares_fallback"
+        return least_squares_scale, label
+    raise AssertionError(f"Unhandled WorldScore scale solver: {solver}")
 
 
 def compute_worldscore_metrics(
@@ -270,6 +325,7 @@ def compute_worldscore_metrics(
     vipe_rot: np.ndarray,
     vipe_pos: np.ndarray,
     mode: str,
+    scale_solver: str = "auto",
 ) -> dict:
     if mode not in {"relative", "raw"}:
         raise ValueError(f"Unsupported worldscore_mode: {mode}")
@@ -285,7 +341,7 @@ def compute_worldscore_metrics(
         gt_eval_pos = gt_pos
         pred_eval_pos = pred_pos_world
 
-    scale, scale_solver = solve_worldscore_scale(gt_eval_pos, pred_eval_pos)
+    scale, scale_solver_name = solve_worldscore_scale(gt_eval_pos, pred_eval_pos, scale_solver)
     scaled_pred_eval_pos = scale * pred_eval_pos
     translation_error = np.linalg.norm(gt_eval_pos - scaled_pred_eval_pos, axis=1)
     rotation_error = rotation_errors_deg(gt_rot, pred_rot_world)
@@ -293,7 +349,7 @@ def compute_worldscore_metrics(
     return {
         "mode": mode,
         "scale": float(scale),
-        "scale_solver": scale_solver,
+        "scale_solver": scale_solver_name,
         "fixed_world_rotation": fixed_world_rotation,
         "pred_rot_world": pred_rot_world,
         "pred_pos_world": pred_pos_world,
@@ -340,14 +396,25 @@ def default_output_path(input_path: Path, suffix: str) -> Path:
 def main() -> int:
     args = parse_args()
     vipe_poses = load_vipe_poses(args.vipe_poses)
-    frame_count = args.frame_count or len(vipe_poses)
+    if args.frame_manifest is not None:
+        if args.frame_count is not None:
+            raise ValueError("--frame_count cannot be combined with --frame_manifest")
+        frame_ids = load_manifest_frame_ids(args.frame_manifest)
+        frame_count = len(frame_ids)
+        if len(vipe_poses) != frame_count:
+            raise ValueError(
+                f"ViPE pose length {len(vipe_poses)} does not match manifest frame count {frame_count}"
+            )
+    else:
+        frame_count = args.frame_count or len(vipe_poses)
+        frame_ids = list(range(args.frame_start, args.frame_start + frame_count))
     if frame_count <= 0:
         raise ValueError("--frame_count must be positive")
     if len(vipe_poses) < frame_count:
         raise ValueError(f"ViPE pose length {len(vipe_poses)} is shorter than frame_count={frame_count}")
 
     vipe_poses = vipe_poses[:frame_count]
-    gt_poses = load_gt_c2w(args, frame_count)
+    gt_poses = load_gt_c2w(args, frame_ids)
 
     gt_rot = gt_poses[:, :3, :3]
     vipe_rot = vipe_poses[:, :3, :3]
@@ -355,7 +422,14 @@ def main() -> int:
     vipe_pos = vipe_poses[:, :3, 3]
     check_rotation_matrices("GT", gt_rot)
     check_rotation_matrices("ViPE", vipe_rot)
-    worldscore = compute_worldscore_metrics(gt_rot, gt_pos, vipe_rot, vipe_pos, args.worldscore_mode)
+    worldscore = compute_worldscore_metrics(
+        gt_rot,
+        gt_pos,
+        vipe_rot,
+        vipe_pos,
+        args.worldscore_mode,
+        args.worldscore_scale_solver,
+    )
 
     if args.align_mode == "none":
         scale = 1.0
@@ -443,7 +517,7 @@ def main() -> int:
         for idx in range(frame_count):
             writer.writerow(
                 [
-                    args.frame_start + idx,
+                    frame_ids[idx],
                     *gt_pos[idx].tolist(),
                     *vipe_pos[idx].tolist(),
                     *aligned_pos[idx].tolist(),
@@ -464,7 +538,9 @@ def main() -> int:
 
     summary = {
         "frame_count": frame_count,
-        "frame_start": args.frame_start,
+        "frame_start": frame_ids[0],
+        "frame_ids": frame_ids,
+        "frame_manifest": str(args.frame_manifest) if args.frame_manifest is not None else None,
         "vipe_poses": str(args.vipe_poses),
         "gt_transforms_json": str(args.gt_transforms_json),
         "align_mode": args.align_mode,
@@ -537,7 +613,7 @@ def main() -> int:
         for idx in range(preview_count):
             preview_rows.append(
                 [
-                    args.frame_start + idx,
+                    frame_ids[idx],
                     f"{trans_error_after[idx]:.9f}",
                     f"{rot_error[idx]:.9f}",
                     f"{worldscore['translation_error'][idx]:.9f}",
