@@ -137,6 +137,51 @@ class PoseI2VInputTest(unittest.TestCase):
             self.assertEqual(source["frame_ids"], [1, 2, 3, 4])
             self.assertEqual([record["segment_id"] for record in source["records"]], [0, 0, 1, 1])
 
+    def test_segments_nested_under_refine_are_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scene_root = self.make_scene(root, [{"saved_ids": [1, 2]}, {"saved_ids": [3, 4]}])
+            metadata_path = scene_root / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["refine"] = {"segments": metadata.pop("segments")}
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            source = infer.validate_pose_i2v_clip(
+                {"id": "scene_a"}, self.args(root, "all_segments")
+            )
+            self.assertEqual(source["frame_ids"], [1, 2, 3, 4])
+            self.assertEqual([record["segment_id"] for record in source["records"]], [0, 0, 1, 1])
+
+    def test_early_moge_layout_without_crop_is_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scene_root = self.make_scene(root, [{"saved_ids": [1]}])
+            frame_path = scene_root / "segment_00" / "frames" / "frame_0001.png"
+            image = np.zeros((10, 8, 3), dtype=np.uint8)
+            image[:4, :, :] = np.array([10, 20, 30], dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(frame_path), image))
+
+            metadata_path = scene_root / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["output_format_version"] = infer.POSE_RENDER_I2V_MOGE_SEGMENT_FIRST_FORMAT_VERSION
+            metadata["segments"][0]["frame_layout"] = {
+                "format": "PNG",
+                "width": 8,
+                "height": 10,
+            }
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            source = infer.validate_pose_i2v_clip(
+                {"id": "scene_a"}, self.args(root, "first_segment")
+            )
+            self.assertEqual(source["generated_crop"], (0, 0, 8, 4))
+            self.assertEqual(source["frame_size"], (4, 8))
+
+    def test_unknown_layout_without_crop_is_rejected(self):
+        segment = {"frame_layout": {"format": "PNG", "width": 8, "height": 10}}
+        with self.assertRaisesRegex(ValueError, "generated_crop=None"):
+            infer._parse_generated_crop(segment, 0, format_version="unknown_format")
+
     def test_segments_may_use_different_crop_coordinates_with_the_same_erp_size(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

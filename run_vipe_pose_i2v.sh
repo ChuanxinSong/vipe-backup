@@ -1,18 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-INPUT_ROOT="${INPUT_ROOT:-}"
-SCOPE="${SCOPE:-first_segment}" # first_segment | all_segments
-SPLIT_JSON="${SPLIT_JSON:-OmniRoam/configs/train_test_files.json}"
+GPU_ID="${GPU_ID:-0}"
+GPU_IDS="${GPU_IDS:-${GPU_ID}}"
+
+INPUT_ROOT="${INPUT_ROOT:-"/home/songcx/code/omniroam/omniroam_results/zeroshot_testset_infer"}"
+SCOPE="${SCOPE:-all_segments}" # first_segment | all_segments
+SPLIT_JSON="${SPLIT_JSON:-omniroam/configs/train_test_files.json}"
+
+CUDA_RESERVE_GIB="${CUDA_RESERVE_GIB:-45}"
+CUDA_RESERVE_SAFETY_GIB="${CUDA_RESERVE_SAFETY_GIB:-2}"
+
 SPLIT_SUBSET="${SPLIT_SUBSET:-test}"
 EXPECTED_SEGMENTS="${EXPECTED_SEGMENTS:-8}"
 VIRTUAL_VIEW_HEIGHT="${VIRTUAL_VIEW_HEIGHT:-256}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${INPUT_ROOT}/vipe_pose_eval/${SCOPE}}"
-CUDA_RESERVE_GIB="${CUDA_RESERVE_GIB:-0}"
-CUDA_RESERVE_SAFETY_GIB="${CUDA_RESERVE_SAFETY_GIB:-2}"
 
-GPU_ID="${GPU_ID:-0}"
-GPU_IDS="${GPU_IDS:-${GPU_ID}}"
 MULTI_PROCESS_LAUNCH="${MULTI_PROCESS_LAUNCH:-1}"
 START_CLIP_IDX="${START_CLIP_IDX:-0}"
 NUM_CLIPS_PER_GPU="${NUM_CLIPS_PER_GPU:-0}"

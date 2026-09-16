@@ -21,6 +21,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("infer_vipe_panorama_pose")
 
 REPO_ROOT = Path(__file__).resolve().parent
+POSE_RENDER_I2V_MOGE_SEGMENT_FIRST_FORMAT_VERSION = "pose_render_i2v_moge_segment_first_v1"
+POSE_I2V_COMPARISON_SEPARATOR_HEIGHT = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -340,11 +342,29 @@ def _load_json_object(path: Path) -> dict:
     return value
 
 
-def _parse_generated_crop(segment: dict, segment_id: int) -> tuple[int, int, int, int]:
+def _parse_generated_crop(
+    segment: dict,
+    segment_id: int,
+    *,
+    format_version: str | None = None,
+) -> tuple[int, int, int, int]:
     layout = segment.get("frame_layout")
     if not isinstance(layout, dict):
         raise ValueError(f"segment_{segment_id:02d} is missing frame_layout.")
     crop = layout.get("generated_crop")
+    if crop is None and format_version == POSE_RENDER_I2V_MOGE_SEGMENT_FIRST_FORMAT_VERSION:
+        width = layout.get("width")
+        total_height = layout.get("height")
+        dimensions_are_integers = (
+            not isinstance(width, bool)
+            and isinstance(width, int)
+            and not isinstance(total_height, bool)
+            and isinstance(total_height, int)
+        )
+        if dimensions_are_integers:
+            content_height = total_height - POSE_I2V_COMPARISON_SEPARATOR_HEIGHT
+            if width > 0 and content_height > 0 and content_height % 2 == 0:
+                crop = [0, 0, width, content_height // 2]
     if (
         not isinstance(crop, list)
         or len(crop) != 4
@@ -386,8 +406,15 @@ def validate_pose_i2v_clip(clip: dict, args: argparse.Namespace) -> dict:
             f"got {metadata.get('scene_id')!r}."
         )
     segments = metadata.get("segments")
+    if segments is None:
+        refine = metadata.get("refine")
+        if isinstance(refine, dict):
+            segments = refine.get("segments")
     if not isinstance(segments, list) or not segments:
-        raise ValueError(f"{metadata_path} must contain a non-empty segments list.")
+        raise ValueError(
+            f"{metadata_path} must contain a non-empty segments list either at the top level "
+            "or under refine."
+        )
 
     if args.pose_i2v_scope == "first_segment":
         selected_segments = segments[:1]
@@ -415,7 +442,8 @@ def validate_pose_i2v_clip(clip: dict, args: argparse.Namespace) -> dict:
             raise ValueError(
                 f"Expected segment_id={expected_segment_id} in {metadata_path}, found {segment_id!r}."
             )
-        crop = _parse_generated_crop(segment, segment_id)
+        format_version = segment.get("output_format_version") or metadata.get("output_format_version")
+        crop = _parse_generated_crop(segment, segment_id, format_version=format_version)
         segment_crops[segment_id] = crop
         if first_crop is None:
             first_crop = crop
