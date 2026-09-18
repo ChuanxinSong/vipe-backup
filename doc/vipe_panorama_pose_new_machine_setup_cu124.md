@@ -339,7 +339,22 @@ mkdir -p "${TORCH_HOME}/hub/droid_slam"
 ${TORCH_HOME}/hub/droid_slam/droid.pth
 ```
 
-如果新机器不能联网，可以从已运行成功的机器复制该文件。当前已验证文件的 SHA256 是：
+也可以在浏览器中打开下面的 Google Drive 链接手动下载：
+
+```text
+https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view
+```
+
+下载完成后，将文件重命名为 `droid.pth`，并放到代码所使用的缓存路径：
+
+```bash
+mkdir -p "${TORCH_HOME}/hub/droid_slam"
+cp /path/to/downloaded/droid.pth "${TORCH_HOME}/hub/droid_slam/droid.pth"
+```
+
+其中 `/path/to/downloaded/droid.pth` 需要替换为浏览器实际下载到的文件路径。如果新机器无法访问 Google Drive，也可以从已运行成功的机器复制该文件到相同位置。
+
+当前已验证文件的 SHA256 是：
 
 ```text
 46476ef64cde45a97504910d6f3de2eef7b398ec1c6e4e668815c29076024526
