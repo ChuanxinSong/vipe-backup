@@ -345,7 +345,23 @@ ${TORCH_HOME}/hub/droid_slam/droid.pth
 https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view
 ```
 
-下载完成后，将文件重命名为 `droid.pth`，并放到代码所使用的缓存路径：
+或者使用 `wget` 直链下载。命令先保存为临时文件，通过 SHA256 校验后再改为最终文件名，避免下载中断或 Google Drive 返回错误页面时留下损坏的 `droid.pth`：
+
+```bash
+DROID_CKPT="${TORCH_HOME}/hub/droid_slam/droid.pth"
+mkdir -p "$(dirname "${DROID_CKPT}")"
+
+wget \
+  --continue \
+  --output-document="${DROID_CKPT}.part" \
+  'https://drive.usercontent.google.com/download?id=1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh&export=download&confirm=t'
+
+echo "46476ef64cde45a97504910d6f3de2eef7b398ec1c6e4e668815c29076024526  ${DROID_CKPT}.part" \
+  | sha256sum --check - \
+  && mv "${DROID_CKPT}.part" "${DROID_CKPT}"
+```
+
+如果使用浏览器手动下载，下载完成后将文件重命名为 `droid.pth`，并放到代码所使用的缓存路径：
 
 ```bash
 mkdir -p "${TORCH_HOME}/hub/droid_slam"
