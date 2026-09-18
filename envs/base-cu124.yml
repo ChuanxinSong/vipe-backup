@@ -1,0 +1,14 @@
+name: vipe-panorama-cu124
+channels:
+  - nvidia/label/cuda-12.4.0
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pip
+  - cuda-nvcc
+  - eigen
+  - zlib
+  - libcusparse-dev
+  - libcublas-dev
+  - libcusolver-dev

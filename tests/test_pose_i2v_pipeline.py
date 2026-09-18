@@ -102,6 +102,39 @@ class PoseI2VInputTest(unittest.TestCase):
         (scene_root / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
         return scene_root
 
+    def make_panoworld_scene(self, root: Path, segments: list[dict]) -> Path:
+        scene_id = "scene_a"
+        scene_root = root / scene_id
+        metadata_segments = []
+        for segment_id, spec in enumerate(segments):
+            saved_ids = spec["saved_ids"]
+            width = spec.get("width", 8)
+            height = spec.get("height", 4)
+            metadata_segments.append(
+                {
+                    "segment_id": segment_id,
+                    "format_version": infer.PANOWORLD_INTERIORGS_ROLLOUT_FORMAT_VERSION,
+                    "saved_frame_ids": saved_ids,
+                    "width": width,
+                    "height": height,
+                }
+            )
+            frames_dir = scene_root / f"segment_{segment_id:02d}" / "frames"
+            frames_dir.mkdir(parents=True)
+            for frame_id in saved_ids:
+                image = np.zeros((2 * height + 2, width, 3), dtype=np.uint8)
+                image[:height, :, :] = np.array([10, 20, frame_id], dtype=np.uint8)
+                image[height : height + 2, :, :] = 255
+                image[height + 2 :, :, :] = np.array([100, 110, 120], dtype=np.uint8)
+                self.assertTrue(cv2.imwrite(str(frames_dir / f"{frame_id:06d}.png"), image))
+        metadata = {
+            "scene_id": scene_id,
+            "format_version": infer.PANOWORLD_INTERIORGS_ROLLOUT_FORMAT_VERSION,
+            "segments": metadata_segments,
+        }
+        (scene_root / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        return scene_root
+
     @staticmethod
     def args(root: Path, scope: str, expected_segments: int = 2) -> argparse.Namespace:
         return argparse.Namespace(
@@ -136,6 +169,43 @@ class PoseI2VInputTest(unittest.TestCase):
             source = infer.validate_pose_i2v_clip({"id": "scene_a"}, self.args(root, "all_segments"))
             self.assertEqual(source["frame_ids"], [1, 2, 3, 4])
             self.assertEqual([record["segment_id"] for record in source["records"]], [0, 0, 1, 1])
+
+    def test_panoworld_contract_infers_crop_and_uses_six_digit_filenames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_panoworld_scene(root, [{"saved_ids": [1, 2]}, {"saved_ids": [3, 4]}])
+
+            source = infer.validate_pose_i2v_clip(
+                {"id": "scene_a"}, self.args(root, "all_segments")
+            )
+
+            self.assertEqual(source["source_format_version"], "panoworld_interiogs_rollout_v1")
+            self.assertEqual(source["frame_ids"], [1, 2, 3, 4])
+            self.assertEqual(source["generated_crop"], (0, 0, 8, 4))
+            self.assertEqual(source["frame_size"], (4, 8))
+            self.assertEqual(source["records"][0]["image_path"].name, "000001.png")
+            image = cv2.imread(str(source["records"][0]["image_path"]), cv2.IMREAD_COLOR)
+            cropped = infer.crop_comparison_image(image, source["records"][0]["generated_crop"])
+            self.assertEqual(cropped.shape, (4, 8, 3))
+            np.testing.assert_array_equal(cropped[0, 0], np.array([10, 20, 1], dtype=np.uint8))
+            stream = infer.create_video_stream(source, resolution=None, name="scene_a")
+            frame = next(iter(stream))
+            self.assertEqual(stream.frame_size(), (4, 8))
+            self.assertEqual(tuple(frame.rgb.shape), (4, 8, 3))
+            np.testing.assert_allclose(
+                frame.rgb[0, 0].numpy(),
+                np.array([1, 20, 10], dtype=np.float32) / 255.0,
+            )
+
+    def test_panoworld_rejects_unexpected_comparison_dimensions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scene_root = self.make_panoworld_scene(root, [{"saved_ids": [1]}])
+            frame_path = scene_root / "segment_00" / "frames" / "000001.png"
+            self.assertTrue(cv2.imwrite(str(frame_path), np.zeros((9, 8, 3), dtype=np.uint8)))
+
+            with self.assertRaisesRegex(ValueError, "Expected PanoWorld comparison image size 8x10"):
+                infer.validate_pose_i2v_clip({"id": "scene_a"}, self.args(root, "first_segment"))
 
     def test_segments_nested_under_refine_are_supported(self):
         with tempfile.TemporaryDirectory() as directory:

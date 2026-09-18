@@ -22,6 +22,7 @@ logger = logging.getLogger("infer_vipe_panorama_pose")
 
 REPO_ROOT = Path(__file__).resolve().parent
 POSE_RENDER_I2V_MOGE_SEGMENT_FIRST_FORMAT_VERSION = "pose_render_i2v_moge_segment_first_v1"
+PANOWORLD_INTERIORGS_ROLLOUT_FORMAT_VERSION = "panoworld_interiogs_rollout_v1"
 POSE_I2V_COMPARISON_SEPARATOR_HEIGHT = 2
 
 
@@ -377,6 +378,29 @@ def _parse_generated_crop(
     return left, top, right, bottom
 
 
+def _parse_panoworld_generated_crop(segment: dict, segment_id: int) -> tuple[int, int, int, int]:
+    width = segment.get("width")
+    height = segment.get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        raise ValueError(
+            f"segment_{segment_id:02d} has invalid PanoWorld width/height: "
+            f"width={width!r}, height={height!r}."
+        )
+    if width != 2 * height:
+        raise ValueError(
+            f"segment_{segment_id:02d} PanoWorld generated frame must be a 2:1 ERP, "
+            f"got width={width}, height={height}."
+        )
+    return 0, 0, width, height
+
+
 def crop_comparison_image(
     image: np.ndarray,
     crop: tuple[int, int, int, int],
@@ -416,6 +440,9 @@ def validate_pose_i2v_clip(clip: dict, args: argparse.Namespace) -> dict:
             "or under refine."
         )
 
+    source_format_version = metadata.get("output_format_version") or metadata.get("format_version")
+    is_panoworld = source_format_version == PANOWORLD_INTERIORGS_ROLLOUT_FORMAT_VERSION
+
     if args.pose_i2v_scope == "first_segment":
         selected_segments = segments[:1]
         expected_segment_ids = [0]
@@ -442,32 +469,60 @@ def validate_pose_i2v_clip(clip: dict, args: argparse.Namespace) -> dict:
             raise ValueError(
                 f"Expected segment_id={expected_segment_id} in {metadata_path}, found {segment_id!r}."
             )
-        format_version = segment.get("output_format_version") or metadata.get("output_format_version")
-        crop = _parse_generated_crop(segment, segment_id, format_version=format_version)
+        format_version = (
+            segment.get("output_format_version")
+            or segment.get("format_version")
+            or source_format_version
+        )
+        if is_panoworld:
+            if format_version != PANOWORLD_INTERIORGS_ROLLOUT_FORMAT_VERSION:
+                raise ValueError(
+                    f"segment_{segment_id:02d} format_version={format_version!r} does not match "
+                    f"metadata format_version={source_format_version!r}."
+                )
+            crop = _parse_panoworld_generated_crop(segment, segment_id)
+            saved_ids_field = "saved_frame_ids"
+        else:
+            crop = _parse_generated_crop(segment, segment_id, format_version=format_version)
+            saved_ids_field = "saved_frame_indices"
         segment_crops[segment_id] = crop
         if first_crop is None:
             first_crop = crop
         elif crop != first_crop:
             crops_are_identical = False
 
-        saved_ids = segment.get("saved_frame_indices")
+        saved_ids = segment.get(saved_ids_field)
         if not isinstance(saved_ids, list) or not saved_ids:
-            raise ValueError(f"segment_{segment_id:02d} is missing non-empty saved_frame_indices.")
+            raise ValueError(f"segment_{segment_id:02d} is missing non-empty {saved_ids_field}.")
         for value in saved_ids:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"segment_{segment_id:02d} has invalid saved frame id {value!r}.")
             frame_id = int(value)
             if previous_frame_id is not None and frame_id <= previous_frame_id:
                 raise ValueError(
-                    f"saved_frame_indices must be globally strictly increasing; got frame_id={frame_id} "
+                    f"{saved_ids_field} must be globally strictly increasing; got frame_id={frame_id} "
                     f"after {previous_frame_id}."
                 )
-            image_path = scene_root / f"segment_{segment_id:02d}" / "frames" / f"frame_{frame_id:04d}.png"
+            image_name = f"{frame_id:06d}.png" if is_panoworld else f"frame_{frame_id:04d}.png"
+            image_path = scene_root / f"segment_{segment_id:02d}" / "frames" / image_name
             if not image_path.is_file():
                 raise FileNotFoundError(f"Comparison image not found: {image_path}")
             image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image_bgr is None:
                 raise ValueError(f"Comparison image cannot be decoded: {image_path}")
+            if is_panoworld:
+                generated_width = crop[2] - crop[0]
+                generated_height = crop[3] - crop[1]
+                expected_comparison_size = (
+                    2 * generated_height + POSE_I2V_COMPARISON_SEPARATOR_HEIGHT,
+                    generated_width,
+                )
+                if image_bgr.shape[:2] != expected_comparison_size:
+                    raise ValueError(
+                        f"Expected PanoWorld comparison image size "
+                        f"{expected_comparison_size[1]}x{expected_comparison_size[0]} in {image_path}, "
+                        f"got {image_bgr.shape[1]}x{image_bgr.shape[0]}."
+                    )
             cropped = crop_comparison_image(image_bgr, crop, image_path=image_path)
             crop_size = cropped.shape[:2]
             if crop_size[1] != crop_size[0] * 2:
@@ -502,7 +557,7 @@ def validate_pose_i2v_clip(clip: dict, args: argparse.Namespace) -> dict:
         "segment_generated_crops": segment_crops,
         "frame_size": common_crop_size,
         "metadata_path": metadata_path,
-        "source_format_version": metadata.get("output_format_version"),
+        "source_format_version": source_format_version,
         "input_root": args.pose_i2v_results_root,
         "scope": args.pose_i2v_scope,
     }

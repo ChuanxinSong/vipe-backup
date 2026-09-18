@@ -53,7 +53,7 @@ OmniRoam/omniroam_results/
     └── ...
 ```
 
-场景 `metadata.json` 必须包含：
+OmniRoam comparison 格式的场景 `metadata.json` 必须包含：
 
 - 与目录名一致的 `scene_id`；
 - 非空 `segments`；
@@ -79,6 +79,29 @@ generated = image[0:320, 0:640]
 
 metadata 采用结构校验，不限制 `output_format_version` 的具体字符串；版本仍会记录到输出 manifest 中。
 
+### PanoWorld raw 兼容格式
+
+读取器也支持 `format_version=panoworld_interiogs_rollout_v1`。该格式仍然保存上下拼接 comparison PNG，但 metadata 和文件名不同：
+
+```text
+<INPUT_ROOT>/<scene_id>/
+├── metadata.json
+├── segment_00/frames/000001.png
+├── ...
+└── segment_07/frames/000641.png
+```
+
+PanoWorld 每个 segment 使用 `saved_frame_ids`，图片使用六位数文件名。metadata 不提供 `frame_layout`，读取器只对明确的 `panoworld_interiogs_rollout_v1` 格式使用 segment 的 `width` 和 `height` 推导布局：
+
+```text
+comparison PNG：width × (2*height+2)
+预测 ERP crop：[0, 0, width, height]
+分隔条：       [0, height, width, height+2]
+GT ERP：       [0, height+2, width, 2*height+2]
+```
+
+当前 PanoWorld 数据对应 `960×962 -> 960×480`。读取器会严格检查 `width=2*height`、comparison PNG 尺寸、六位数文件是否存在、frame ID 全局递增以及所有 crop 尺寸一致；未知的无 `frame_layout` 格式仍会拒绝，避免猜测 crop 后误用 GT 图像。
+
 ## 3. 两种评估范围
 
 ### first_segment
@@ -91,7 +114,7 @@ frame 1..81，共 81 帧
 
 ### all_segments
 
-默认严格要求 8 段，即 `segment_00..segment_07`。按每段 `saved_frame_indices` 顺序拼接，并要求全局 frame ID 严格递增、不重复。当前数据通常对应：
+默认严格要求 8 段，即 `segment_00..segment_07`。OmniRoam 按每段 `saved_frame_indices`、PanoWorld 按 `saved_frame_ids` 顺序拼接，并要求全局 frame ID 严格递增、不重复。当前数据通常对应：
 
 ```text
 frame 1..641，共 641 帧
@@ -109,6 +132,16 @@ comparison PNG 640×642
   -> EquirectProjectionProcessor，得到 5 个 256×256 pinhole 视图
   -> StandardResizeStreamProcessor，缩放到 443×443
   -> 中心裁剪到 440×440
+  -> ViPE SLAM
+```
+
+PanoWorld 使用同一条内存 crop 和投影链路，只是原生 comparison/crop 尺寸不同：
+
+```text
+comparison PNG 960×962
+  -> format_version + width/height 推导 crop，得到预测 ERP 960×480
+  -> EquirectProjectionProcessor，得到 5 个 256×256 pinhole 视图
+  -> StandardResizeStreamProcessor，缩放并中心裁剪到 440×440
   -> ViPE SLAM
 ```
 
